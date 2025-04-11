@@ -6,11 +6,7 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
-app.config['DATABASE'] = 'instance/users.db'
-app.config['UPLOAD_FOLDER'] = 'static/uploads'
-
-os.makedirs('instance', exist_ok=True)
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+app.config['DATABASE'] = 'users.db'
 
 def get_db():
     conn = sqlite3.connect(app.config['DATABASE'])
