@@ -1,12 +1,11 @@
 from flask import Flask, render_template, request, jsonify, Response
-import cv2
-import numpy as np
 import sqlite3
 import os
 from datetime import datetime
 import threading
 import time
 import mediapipe as mp
+import numpy as np
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'static'
@@ -17,19 +16,15 @@ mp_drawing = mp.solutions.drawing_utils
 pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 # Глобальные переменные
-camera = None
-frame = None
-lock = threading.Lock()
-is_stream_active = False
 current_exercise = "pushups"
 current_angle = 0
 is_correct_form = False
 
 # Идеальные углы для упражнений
 IDEAL_ANGLES = {
-    "pushups": {"min": 80, "max": 100},  # Угол в локте при отжиманиях
-    "squats": {"min": 80, "max": 100},   # Угол в коленях при приседаниях
-    "pullups": {"min": 120, "max": 150}  # Угол в локте при подтягиваниях
+    "pushups": {"min": 80, "max": 100},
+    "squats": {"min": 80, "max": 100},
+    "pullups": {"min": 120, "max": 150}
 }
 
 def get_db_connection():
@@ -41,13 +36,8 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Удаляем старые таблицы, если они существуют
-    cursor.execute('DROP TABLE IF EXISTS workouts')
-    cursor.execute('DROP TABLE IF EXISTS workout_data')
-    
-    # Создаем таблицу workouts с ВСЕМИ необходимыми столбцами
     cursor.execute('''
-        CREATE TABLE workouts (
+        CREATE TABLE IF NOT EXISTS workouts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER DEFAULT 1,
             start_time TEXT NOT NULL,
@@ -60,9 +50,8 @@ def init_db():
         )
     ''')
     
-    # Создаем таблицу workout_data
     cursor.execute('''
-        CREATE TABLE workout_data (
+        CREATE TABLE IF NOT EXISTS workout_data (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             workout_id INTEGER NOT NULL,
             timestamp TEXT NOT NULL,
@@ -74,7 +63,6 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("Database initialized with correct schema")
 
 def calculate_angle(a, b, c):
     a = np.array(a)
@@ -86,117 +74,10 @@ def calculate_angle(a, b, c):
     
     return angle if angle <= 180 else 360 - angle
 
-def generate_frames():
-    global frame, lock, is_stream_active, current_angle, is_correct_form
-    
-    while is_stream_active:
-        with lock:
-            if frame is None:
-                continue
-                
-            # Определяем цвет для отрисовки (зеленый/красный)
-            color = (0, 255, 0) if is_correct_form else (0, 0, 255)
-            
-            # Добавляем текст с углом
-            cv2.putText(frame, f"Angle: {current_angle:.1f}°", (50, 50), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            
-            # Добавляем индикатор правильности формы
-            status_text = "CORRECT FORM" if is_correct_form else "INCORRECT FORM"
-            cv2.putText(frame, status_text, (50, 100), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-def video_stream():
-    global camera, frame, lock, is_stream_active, pose, current_exercise
-    global current_angle, is_correct_form
-    
-    camera = cv2.VideoCapture(0)
-    is_stream_active = True
-    
-    while is_stream_active:
-        success, img = camera.read()
-        if not success:
-            break
-            
-        # Обработка изображения с MediaPipe
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = pose.process(img_rgb)
-        
-        if results.pose_landmarks:
-            # Определяем ключевые точки в зависимости от упражнения
-            landmarks = results.pose_landmarks.landmark
-            
-            if current_exercise == "pushups":
-                # Для отжиманий: плечо-локоть-запястье
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-            elif current_exercise == "squats":
-                # Для приседаний: бедро-колено-лодыжка
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value]
-            else:  # pullups
-                # Для подтягиваний: плечо-локоть-запястье
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-            
-            # Рассчитываем угол
-            current_angle = calculate_angle(
-                [shoulder.x, shoulder.y],
-                [elbow.x, elbow.y],
-                [wrist.x, wrist.y]
-            )
-            
-            # Проверяем правильность формы
-            ideal = IDEAL_ANGLES[current_exercise]
-            is_correct_form = ideal["min"] <= current_angle <= ideal["max"]
-            
-            # Отрисовываем скелет с цветом в зависимости от правильности формы
-            color = (0, 255, 0) if is_correct_form else (0, 0, 255)
-            mp_drawing.draw_landmarks(
-                img, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2),
-                mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2)
-            )
-        
-        with lock:
-            frame = img.copy()
-    
-    camera.release()
-
 @app.route('/')
 def index():
     init_db()
     return render_template('index.html')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(),
-                   mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/api/start_stream', methods=['POST'])
-def start_stream():
-    global is_stream_active
-    if not is_stream_active:
-        is_stream_active = True
-        threading.Thread(target=video_stream, daemon=True).start()
-        time.sleep(1)
-        return jsonify({'status': 'success'})
-    return jsonify({'status': 'error', 'message': 'Stream already running'})
-
-@app.route('/api/stop_stream', methods=['POST'])
-def stop_stream():
-    global is_stream_active
-    is_stream_active = False
-    return jsonify({'status': 'success'})
 
 @app.route('/api/set_exercise', methods=['POST'])
 def set_exercise():
@@ -204,6 +85,40 @@ def set_exercise():
     data = request.json
     current_exercise = data.get('exercise_type', 'pushups')
     return jsonify({'status': 'success'})
+
+@app.route('/api/process_frame', methods=['POST'])
+def process_frame():
+    try:
+        # Получаем данные кадра от клиента
+        data = request.json
+        landmarks = data.get('landmarks')
+        
+        if not landmarks:
+            return jsonify({'status': 'error', 'message': 'No landmarks provided'}), 400
+            
+        # Рассчитываем угол
+        shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
+        wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+        
+        angle = calculate_angle(
+            [shoulder['x'], shoulder['y']],
+            [elbow['x'], elbow['y']],
+            [wrist['x'], wrist['y']]
+        )
+        
+        # Проверяем правильность формы
+        ideal = IDEAL_ANGLES[current_exercise]
+        is_correct = ideal["min"] <= angle <= ideal["max"]
+        
+        return jsonify({
+            'status': 'success',
+            'angle': angle,
+            'is_correct': is_correct
+        })
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 def start_workout(exercise_type):
     conn = get_db_connection()
