@@ -4,5 +4,5 @@ tensorflow==2.19.0
 numpy==1.26.4
 opencv-python==4.7.0.72
 gunicorn==21.2.0
-protobuf==3.20.3
+protobuf==4.25.3
 mediapipe==0.10.21
