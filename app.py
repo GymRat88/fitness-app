@@ -1,29 +1,16 @@
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
 import sqlite3
 import os
 from datetime import datetime
-import threading
-import time
-import mediapipe as mp
 import numpy as np
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'static'
 
-# Инициализация MediaPipe
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-# Глобальные переменные
-current_exercise = "pushups"
-current_angle = 0
-is_correct_form = False
-
 # Идеальные углы для упражнений
 IDEAL_ANGLES = {
     "pushups": {"min": 80, "max": 100},
-    "squats": {"min": 80, "max": 100},
+    "squats": {"min": 80, "max": 100}, 
     "pullups": {"min": 120, "max": 150}
 }
 
@@ -81,26 +68,39 @@ def index():
 
 @app.route('/api/set_exercise', methods=['POST'])
 def set_exercise():
-    global current_exercise
     data = request.json
-    current_exercise = data.get('exercise_type', 'pushups')
+    exercise_type = data.get('exercise_type', 'pushups')
+    
+    if exercise_type not in IDEAL_ANGLES:
+        return jsonify({'status': 'error', 'message': 'Invalid exercise type'}), 400
+        
     return jsonify({'status': 'success'})
 
-@app.route('/api/process_frame', methods=['POST'])
-def process_frame():
+@app.route('/api/process_pose', methods=['POST'])
+def process_pose():
     try:
-        # Получаем данные кадра от клиента
         data = request.json
         landmarks = data.get('landmarks')
+        exercise_type = data.get('exercise_type', 'pushups')
         
         if not landmarks:
             return jsonify({'status': 'error', 'message': 'No landmarks provided'}), 400
             
-        # Рассчитываем угол
-        shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-        elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-        wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+        # Определяем ключевые точки для упражнения
+        if exercise_type == "pushups":
+            shoulder = landmarks[11]  # LEFT_SHOULDER
+            elbow = landmarks[13]     # LEFT_ELBOW
+            wrist = landmarks[15]     # LEFT_WRIST
+        elif exercise_type == "squats":
+            shoulder = landmarks[23]  # LEFT_HIP
+            elbow = landmarks[25]     # LEFT_KNEE
+            wrist = landmarks[27]     # LEFT_ANKLE
+        else:  # pullups
+            shoulder = landmarks[11]  # LEFT_SHOULDER
+            elbow = landmarks[13]     # LEFT_ELBOW
+            wrist = landmarks[15]     # LEFT_WRIST
         
+        # Рассчитываем угол
         angle = calculate_angle(
             [shoulder['x'], shoulder['y']],
             [elbow['x'], elbow['y']],
@@ -108,7 +108,7 @@ def process_frame():
         )
         
         # Проверяем правильность формы
-        ideal = IDEAL_ANGLES[current_exercise]
+        ideal = IDEAL_ANGLES[exercise_type]
         is_correct = ideal["min"] <= angle <= ideal["max"]
         
         return jsonify({
@@ -119,89 +119,6 @@ def process_frame():
         
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
-
-def start_workout(exercise_type):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        INSERT INTO workouts (
-            start_time, 
-            exercise_type,
-            correct_count,
-            total_count,
-            correct_percentage
-        ) VALUES (?, ?, 0, 0, 0)
-    ''', (datetime.now().isoformat(), exercise_type))
-    
-    workout_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return workout_id
-
-def save_workout_data(workout_id, angle, is_correct):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Добавляем запись о угле
-    cursor.execute('''
-        INSERT INTO workout_data (
-            workout_id,
-            timestamp,
-            angle,
-            is_correct
-        ) VALUES (?, ?, ?, ?)
-    ''', (workout_id, datetime.now().isoformat(), angle, is_correct))
-    
-    # Обновляем статистику тренировки
-    cursor.execute('''
-        UPDATE workouts 
-        SET 
-            total_count = total_count + 1,
-            correct_count = correct_count + ?,
-            correct_percentage = (correct_count + ?) * 100.0 / (total_count + 1)
-        WHERE id = ?
-    ''', (1 if is_correct else 0, 1 if is_correct else 0, workout_id))
-    
-    conn.commit()
-    conn.close()
-
-def end_workout(workout_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Рассчитываем длительность тренировки
-    cursor.execute('''
-        UPDATE workouts 
-        SET 
-            end_time = ?,
-            duration_sec = ROUND((julianday(?) - julianday(start_time)) * 86400)
-        WHERE id = ?
-    ''', (datetime.now().isoformat(), datetime.now().isoformat(), workout_id))
-    
-    conn.commit()
-    conn.close()
-
-def get_workout_history(limit=10):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT 
-            id,
-            start_time,
-            end_time,
-            exercise_type,
-            duration_sec,
-            correct_percentage
-        FROM workouts
-        ORDER BY start_time DESC
-        LIMIT ?
-    ''', (limit,))
-    
-    history = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return history
 
 @app.route('/api/start_workout', methods=['POST'])
 def api_start_workout():
