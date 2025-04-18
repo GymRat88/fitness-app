@@ -1,20 +1,18 @@
-import os
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO
 import cv2
 import numpy as np
 import sqlite3
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
-from flask_socketio import SocketIO
 import mediapipe as mp
-import eventlet
 import base64
-import threading
+import eventlet
 
 eventlet.monkey_patch()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode='eventlet')
+socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
 
 # Инициализация MediaPipe
 mp_pose = mp.solutions.pose
@@ -85,55 +83,71 @@ def calculate_angle(a, b, c):
     
     return angle if angle <= 180 else 360 - angle
 
-def process_frame(frame, exercise_type):
-    global current_angle, is_correct_form
-    
+@socketio.on('frame')
+def handle_frame(data):
     try:
-        # Конвертируем и обрабатываем кадр
+        # Декодируем изображение
+        frame_data = data['frame'].split(',')[1]
+        nparr = np.frombuffer(base64.b64decode(frame_data), np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Обработка кадра с MediaPipe
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(frame_rgb)
         
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
+            exercise_type = data.get('exercise_type', 'pushups')
             
+            # Выбор точек для анализа в зависимости от упражнения
             if exercise_type == "pushups":
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+                a = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * frame.shape[0]]
+                b = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y * frame.shape[0]]
+                c = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * frame.shape[0]]
             elif exercise_type == "squats":
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+                a = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y * frame.shape[0]]
+                b = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y * frame.shape[0]]
+                c = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * frame.shape[0]]
             else:  # pullups
-                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+                a = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * frame.shape[0]]
+                b = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y * frame.shape[0]]
+                c = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * frame.shape[1],
+                     landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * frame.shape[0]]
             
-            # Рассчитываем угол
-            current_angle = calculate_angle(
-                [shoulder.x * frame.shape[1], shoulder.y * frame.shape[0]],
-                [elbow.x * frame.shape[1], elbow.y * frame.shape[0]],
-                [wrist.x * frame.shape[1], wrist.y * frame.shape[0]]
-            )
+            # Расчет угла
+            angle = calculate_angle(a, b, c)
+            is_correct = IDEAL_ANGLES[exercise_type]['min'] <= angle <= IDEAL_ANGLES[exercise_type]['max']
             
-            # Проверяем правильность формы
-            ideal = IDEAL_ANGLES[exercise_type]
-            is_correct_form = ideal["min"] <= current_angle <= ideal["max"]
-            
-            # Отрисовываем скелет
-            color = (0, 255, 0) if is_correct_form else (0, 0, 255)
+            # Отрисовка скелета
+            color = (0, 255, 0) if is_correct else (0, 0, 255)
             mp_drawing.draw_landmarks(
                 frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                 mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2),
                 mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2)
             )
             
-            # Добавляем текст с углом
-            cv2.putText(frame, f"Angle: {current_angle:.1f}°", (20, 50), 
+            # Добавление текста
+            cv2.putText(frame, f"Angle: {angle:.1f}°", (20, 50), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
             
-            return frame, current_angle, is_correct_form
-        
+            # Отправка результатов клиенту
+            _, buffer = cv2.imencode('.jpg', frame)
+            processed_frame = base64.b64encode(buffer).decode('utf-8')
+            
+            socketio.emit('processed_frame', {
+                'frame': 'data:image/jpeg;base64,' + processed_frame,
+                'angle': angle,
+                'is_correct': is_correct
+            }, room=request.sid)
+            
     except Exception as e:
         print(f"Error processing frame: {e}")
     
