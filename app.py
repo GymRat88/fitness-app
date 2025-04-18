@@ -1,19 +1,20 @@
-from flask import Flask, render_template, request, jsonify, Response
+import os
 import cv2
 import numpy as np
 import sqlite3
-import os
 from datetime import datetime
-import threading
-import time
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO
 import mediapipe as mp
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder
-import asyncio
-import json
+import eventlet
+import base64
+import threading
+
+eventlet.monkey_patch()
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'static'
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, async_mode='eventlet')
 
 # Инициализация MediaPipe
 mp_pose = mp.solutions.pose
@@ -24,7 +25,7 @@ pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 current_exercise = "pushups"
 current_angle = 0
 is_correct_form = False
-pc = None
+clients = {}
 
 # Идеальные углы для упражнений
 IDEAL_ANGLES = {
@@ -41,6 +42,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    
     cursor.execute('DROP TABLE IF EXISTS workouts')
     cursor.execute('DROP TABLE IF EXISTS workout_data')
     
@@ -83,72 +85,64 @@ def calculate_angle(a, b, c):
     
     return angle if angle <= 180 else 360 - angle
 
+def process_frame(frame, exercise_type):
+    global current_angle, is_correct_form
+    
+    try:
+        # Конвертируем и обрабатываем кадр
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(frame_rgb)
+        
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            
+            if exercise_type == "pushups":
+                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
+                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+            elif exercise_type == "squats":
+                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
+                elbow = landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value]
+                wrist = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+            else:  # pullups
+                shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
+                wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+            
+            # Рассчитываем угол
+            current_angle = calculate_angle(
+                [shoulder.x * frame.shape[1], shoulder.y * frame.shape[0]],
+                [elbow.x * frame.shape[1], elbow.y * frame.shape[0]],
+                [wrist.x * frame.shape[1], wrist.y * frame.shape[0]]
+            )
+            
+            # Проверяем правильность формы
+            ideal = IDEAL_ANGLES[exercise_type]
+            is_correct_form = ideal["min"] <= current_angle <= ideal["max"]
+            
+            # Отрисовываем скелет
+            color = (0, 255, 0) if is_correct_form else (0, 0, 255)
+            mp_drawing.draw_landmarks(
+                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2),
+                mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2)
+            )
+            
+            # Добавляем текст с углом
+            cv2.putText(frame, f"Angle: {current_angle:.1f}°", (20, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            
+            return frame, current_angle, is_correct_form
+        
+    except Exception as e:
+        print(f"Error processing frame: {e}")
+    
+    return frame, 0, False
+
 @app.route('/')
 def index():
     init_db()
     return render_template('index.html')
-
-@app.route('/api/webrtc_offer', methods=['POST'])
-async def webrtc_offer():
-    global pc, current_exercise
-    
-    params = await request.json
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-    
-    pc = RTCPeerConnection()
-    
-    @pc.on("track")
-    def on_track(track):
-        print(f"Track received: {track.kind}")
-        
-        if track.kind == "video":
-            @track.on("frame")
-            def on_frame(frame):
-                try:
-                    img = frame.to_ndarray(format="bgr24")
-                    process_frame(img)
-                except Exception as e:
-                    print(f"Frame processing error: {e}")
-    
-    await pc.setRemoteDescription(offer)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    
-    return jsonify({
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type
-    })
-
-def process_frame(frame):
-    global current_angle, is_correct_form, current_exercise
-    
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(img_rgb)
-    
-    if results.pose_landmarks:
-        landmarks = results.pose_landmarks.landmark
-        
-        if current_exercise == "pushups":
-            shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-            elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-            wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-        elif current_exercise == "squats":
-            shoulder = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
-            elbow = landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value]
-            wrist = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value]
-        else:  # pullups
-            shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-            elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
-            wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-        
-        current_angle = calculate_angle(
-            [shoulder.x, shoulder.y],
-            [elbow.x, elbow.y],
-            [wrist.x, wrist.y]
-        )
-        
-        ideal = IDEAL_ANGLES[current_exercise]
-        is_correct_form = ideal["min"] <= current_angle <= ideal["max"]
 
 @app.route('/api/set_exercise', methods=['POST'])
 def set_exercise():
@@ -322,7 +316,47 @@ def api_workout_details():
             'message': str(e)
         }), 500
 
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected:', request.sid)
+    clients[request.sid] = {'exercise': 'pushups'}
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected:', request.sid)
+    clients.pop(request.sid, None)
+
+@socketio.on('set_exercise')
+def handle_set_exercise(data):
+    if request.sid in clients:
+        clients[request.sid]['exercise'] = data.get('exercise_type', 'pushups')
+
+@socketio.on('video_frame')
+def handle_video_frame(data):
+    try:
+        if request.sid not in clients:
+            return
+            
+        # Декодируем кадр
+        frame_data = data['frame'].split(',')[1]
+        nparr = np.frombuffer(base64.b64decode(frame_data), np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Обрабатываем кадр
+        exercise_type = clients[request.sid]['exercise']
+        processed_frame, angle, is_correct = process_frame(frame, exercise_type)
+        
+        # Отправляем результаты обратно клиенту
+        socketio.emit('pose_data', {
+            'angle': angle,
+            'is_correct': is_correct,
+            'exercise_type': exercise_type
+        }, room=request.sid)
+        
+    except Exception as e:
+        print(f"Error processing video frame: {e}")
+
 if __name__ == '__main__':
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
