@@ -40,10 +40,11 @@
             overflow: hidden;
             background-color: #000;
         }
-        #videoFeed {
+        #user_video {
             width: 100%;
             height: 100%;
             object-fit: cover;
+            transform: scaleX(-1); /* Зеркальное отображение */
         }
         .controls {
             display: flex;
@@ -128,11 +129,18 @@
             border-radius: 5px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
+        #webrtc-status {
+            text-align: center;
+            margin-bottom: 15px;
+            font-weight: bold;
+            color: var(--color-primary);
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Фитнес-анализатор упражнений</h1>
+        <div id="webrtc-status">Статус: Камера отключена</div>
         
         <div class="exercise-selector">
             <label for="exercise_type">Выберите упражнение: </label>
@@ -144,15 +152,15 @@
         </div>
         
         <div id="video-container">
-            <img id="videoFeed" src="" alt="Видеопоток с камеры">
+            <video id="user_video" autoplay playsinline></video>
         </div>
         
         <div class="controls">
-            <button id="start_stream_button">
+            <button id="start_camera_button">
                 <span class="status-indicator"></span>
                 Включить камеру
             </button>
-            <button id="stop_stream_button" disabled>
+            <button id="stop_camera_button" disabled>
                 <span class="status-indicator"></span>
                 Выключить камеру
             </button>
@@ -201,9 +209,9 @@
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             // DOM элементы
-            const videoFeed = document.getElementById('videoFeed');
-            const startStreamBtn = document.getElementById('start_stream_button');
-            const stopStreamBtn = document.getElementById('stop_stream_button');
+            const videoElement = document.getElementById('user_video');
+            const startCameraBtn = document.getElementById('start_camera_button');
+            const stopCameraBtn = document.getElementById('stop_camera_button');
             const startWorkoutBtn = document.getElementById('start_workout_button');
             const endWorkoutBtn = document.getElementById('end_workout_button');
             const exerciseSelect = document.getElementById('exercise_type');
@@ -214,16 +222,20 @@
             const timeDisplay = document.getElementById('time_display');
             const correctPercentageDisplay = document.getElementById('correct_percentage');
             const workoutHistoryContainer = document.getElementById('workout_history');
+            const webrtcStatus = document.getElementById('webrtc-status');
             
             // Переменные состояния
+            let pc = null;
             let workoutId = null;
             let workoutStartTime = null;
             let workoutInterval = null;
             let angleCheckInterval = null;
             let currentExercise = exerciseSelect.value;
-            let isStreamActive = false;
+            let isCameraActive = false;
+            let isWorkoutActive = false;
             let correctCount = 0;
             let totalCount = 0;
+            let localStream = null;
             
             // Обновляем отображение упражнения
             const updateExerciseDisplay = () => {
@@ -283,7 +295,7 @@
                 currentExercise = exerciseSelect.value;
                 updateExerciseDisplay();
                 
-                if (isStreamActive) {
+                if (isWorkoutActive) {
                     try {
                         await fetch('/api/set_exercise', {
                             method: 'POST',
@@ -300,82 +312,100 @@
                 }
             });
             
-            // Обработчик старта видеопотока
-            startStreamBtn.addEventListener('click', async () => {
+            // Обработчик старта камеры через WebRTC
+            startCameraBtn.addEventListener('click', async () => {
                 try {
-                    const response = await fetch('/api/start_stream', {
+                    // Получаем доступ к камере пользователя
+                    localStream = await navigator.mediaDevices.getUserMedia({ 
+                        video: {
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            facingMode: 'user'
+                        },
+                        audio: false
+                    });
+                    
+                    videoElement.srcObject = localStream;
+                    webrtcStatus.textContent = "Статус: Камера подключена";
+                    webrtcStatus.style.color = "var(--color-correct)";
+                    
+                    // Настройка соединения WebRTC
+                    const configuration = {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' }
+                        ]
+                    };
+                    
+                    pc = new RTCPeerConnection(configuration);
+                    
+                    // Добавляем треки в соединение
+                    localStream.getTracks().forEach(track => {
+                        pc.addTrack(track, localStream);
+                    });
+                    
+                    // Создаем offer
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    
+                    // Отправляем offer на сервер
+                    const response = await fetch('/api/webrtc_offer', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
-                        }
+                        },
+                        body: JSON.stringify(pc.localDescription)
                     });
                     
-                    const data = await response.json();
+                    const answer = await response.json();
+                    await pc.setRemoteDescription(new RTCSessionDescription(answer));
                     
-                    if (data.status === 'success') {
-                        videoFeed.src = '/video_feed';
-                        isStreamActive = true;
-                        
-                        // Обновляем UI
-                        startStreamBtn.disabled = true;
-                        stopStreamBtn.disabled = false;
-                        startWorkoutBtn.disabled = false;
-                        
-                        // Устанавливаем текущее упражнение на сервере
-                        await fetch('/api/set_exercise', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                exercise_type: currentExercise
-                            })
-                        });
-                    }
+                    // Обновляем UI
+                    isCameraActive = true;
+                    startCameraBtn.disabled = true;
+                    stopCameraBtn.disabled = false;
+                    startWorkoutBtn.disabled = false;
+                    
                 } catch (error) {
-                    console.error('Ошибка запуска потока:', error);
-                    alert('Не удалось запустить видеопоток');
+                    console.error('Ошибка запуска камеры:', error);
+                    webrtcStatus.textContent = "Статус: Ошибка подключения камеры";
+                    webrtcStatus.style.color = "var(--color-incorrect)";
+                    alert('Не удалось подключить камеру: ' + error.message);
                 }
             });
             
-            // Обработчик остановки видеопотока
-            stopStreamBtn.addEventListener('click', async () => {
-                try {
-                    const response = await fetch('/api/stop_stream', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        }
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.status === 'success') {
-                        videoFeed.src = '';
-                        isStreamActive = false;
-                        
-                        // Обновляем UI
-                        startStreamBtn.disabled = false;
-                        stopStreamBtn.disabled = true;
-                        startWorkoutBtn.disabled = true;
-                        endWorkoutBtn.disabled = true;
-                        
-                        // Сбрасываем данные тренировки, если она была активна
-                        if (workoutInterval) {
-                            clearInterval(workoutInterval);
-                            workoutInterval = null;
-                        }
-                        if (angleCheckInterval) {
-                            clearInterval(angleCheckInterval);
-                            angleCheckInterval = null;
-                        }
-                        
-                        formStatusText.textContent = 'Не анализируется';
-                        formStatusIndicator.className = 'status-indicator';
-                    }
-                } catch (error) {
-                    console.error('Ошибка остановки потока:', error);
+            // Обработчик остановки камеры
+            stopCameraBtn.addEventListener('click', () => {
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
                 }
+                if (pc) {
+                    pc.close();
+                    pc = null;
+                }
+                
+                videoElement.srcObject = null;
+                webrtcStatus.textContent = "Статус: Камера отключена";
+                webrtcStatus.style.color = "var(--color-primary)";
+                
+                isCameraActive = false;
+                startCameraBtn.disabled = false;
+                stopCameraBtn.disabled = true;
+                startWorkoutBtn.disabled = true;
+                endWorkoutBtn.disabled = true;
+                
+                // Сбрасываем данные тренировки, если она была активна
+                if (workoutInterval) {
+                    clearInterval(workoutInterval);
+                    workoutInterval = null;
+                }
+                if (angleCheckInterval) {
+                    clearInterval(angleCheckInterval);
+                    angleCheckInterval = null;
+                }
+                
+                formStatusText.textContent = 'Не анализируется';
+                formStatusIndicator.className = 'status-indicator';
             });
             
             // Обработчик начала тренировки
@@ -398,6 +428,7 @@
                         workoutStartTime = Date.now();
                         correctCount = 0;
                         totalCount = 0;
+                        isWorkoutActive = true;
                         
                         // Обновляем UI
                         startWorkoutBtn.disabled = true;
@@ -409,11 +440,11 @@
                             timeDisplay.textContent = `${elapsedSeconds} сек`;
                         }, 1000);
                         
-                        // Запускаем проверку углов
+                        // Запускаем проверку углов (в демо-режиме - случайные значения)
                         angleCheckInterval = setInterval(async () => {
                             try {
-                                // В реальном приложении угол должен приходить с сервера
-                                // Для примера используем случайное значение
+                                // В реальном приложении угол должен приходить с сервера через WebSocket
+                                // Для демо используем случайные значения
                                 const mockAngle = Math.floor(Math.random() * 180);
                                 const idealAngles = {
                                     'pushups': { min: 80, max: 100 },
@@ -421,7 +452,7 @@
                                     'pullups': { min: 120, max: 150 }
                                 };
                                 const ideal = idealAngles[currentExercise] || idealAngles.pushups;
-                                const isCorrect = ideal.min <= mockAngle <= ideal.max;
+                                const isCorrect = mockAngle >= ideal.min && mockAngle <= ideal.max;
                                 
                                 // Обновляем UI
                                 angleDisplay.textContent = `${mockAngle}°`;
@@ -481,13 +512,14 @@
                         // Останавливаем таймеры
                         clearInterval(workoutInterval);
                         clearInterval(angleCheckInterval);
+                        isWorkoutActive = false;
                         
                         // Обновляем UI
                         startWorkoutBtn.disabled = false;
                         endWorkoutBtn.disabled = true;
                         
                         // Показываем статистику
-                        alert(`Тренировка завершена!\nПравильных движений: ${data.stats.correct_percentage.toFixed(1)}%`);
+                        alert(`Тренировка завершена!\nПравильных движений: ${data.stats?.correct_percentage?.toFixed(1) || 0}%`);
                         
                         // Обновляем историю
                         loadWorkoutHistory();
