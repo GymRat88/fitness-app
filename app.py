@@ -143,15 +143,15 @@ def process_frame(frame, exercise_type="pushups"):
         # Получаем точки для расчета угла
         a = [
             landmarks[config["points"]["a"].x * frame.shape[1],
-            landmarks[config["points"]["a"].y * frame.shape[0]
+            landmarks[config["points"]["a"].y * frame.shape[0],
         ]
         b = [
             landmarks[config["points"]["b"].x * frame.shape[1],
-            landmarks[config["points"]["b"].y * frame.shape[0]
+            landmarks[config["points"]["b"].y * frame.shape[0],
         ]
         c = [
             landmarks[config["points"]["c"].x * frame.shape[1],
-            landmarks[config["points"]["c"].y * frame.shape[0]
+            landmarks[config["points"]["c"].y * frame.shape[0],
         ]
 
         # Рассчитываем угол
