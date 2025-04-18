@@ -44,7 +44,15 @@
             width: 100%;
             height: 100%;
             object-fit: cover;
-            transform: scaleX(-1); /* Зеркальное отображение */
+            transform: scaleX(-1);
+        }
+        #pose_canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
         }
         .controls {
             display: flex;
@@ -129,18 +137,31 @@
             border-radius: 5px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
-        #webrtc-status {
+        #connection-status {
             text-align: center;
             margin-bottom: 15px;
             font-weight: bold;
-            color: var(--color-primary);
+            padding: 8px;
+            border-radius: 5px;
+        }
+        .connected {
+            background-color: var(--color-correct);
+            color: white;
+        }
+        .disconnected {
+            background-color: var(--color-incorrect);
+            color: white;
+        }
+        .connecting {
+            background-color: #f39c12;
+            color: white;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Фитнес-анализатор упражнений</h1>
-        <div id="webrtc-status">Статус: Камера отключена</div>
+        <div id="connection-status" class="disconnected">Статус: Отключено</div>
         
         <div class="exercise-selector">
             <label for="exercise_type">Выберите упражнение: </label>
@@ -153,6 +174,7 @@
         
         <div id="video-container">
             <video id="user_video" autoplay playsinline></video>
+            <canvas id="pose_canvas"></canvas>
         </div>
         
         <div class="controls">
@@ -209,6 +231,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', () => {
+            // DOM элементы
             const videoElement = document.getElementById('user_video');
             const poseCanvas = document.getElementById('pose_canvas');
             const ctx = poseCanvas.getContext('2d');
@@ -217,9 +240,16 @@
             const startWorkoutBtn = document.getElementById('start_workout_button');
             const endWorkoutBtn = document.getElementById('end_workout_button');
             const exerciseSelect = document.getElementById('exercise_type');
+            const currentExerciseDisplay = document.getElementById('current_exercise');
+            const angleDisplay = document.getElementById('angle_display');
+            const formStatusIndicator = document.querySelector('#form_status .status-indicator');
+            const formStatusText = document.getElementById('form_status_text');
+            const timeDisplay = document.getElementById('time_display');
+            const correctPercentageDisplay = document.getElementById('correct_percentage');
+            const workoutHistoryContainer = document.getElementById('workout_history');
             const connectionStatus = document.getElementById('connection-status');
-            
-            // Остальные переменные состояния
+
+            // Переменные состояния
             let socket = null;
             let stream = null;
             let workoutId = null;
@@ -233,31 +263,44 @@
             let totalCount = 0;
             let frameInterval = null;
 
-            // Подключение к Socket.IO
-            function connectSocket() {
-                socket = io();
-                
+            // Инициализация Socket.IO соединения
+            function initSocketConnection() {
+                socket = io({
+                    reconnection: true,
+                    reconnectionAttempts: 5,
+                    reconnectionDelay: 1000,
+                    transports: ['websocket']
+                });
+
                 socket.on('connect', () => {
-                    connectionStatus.textContent = 'Статус: Подключено';
-                    connectionStatus.style.color = 'var(--color-correct)';
+                    updateConnectionStatus('connected', 'Подключено к серверу');
+                    if (isCameraActive) {
+                        startFrameProcessing();
+                    }
                 });
-                
+
                 socket.on('disconnect', () => {
-                    connectionStatus.textContent = 'Статус: Отключено';
-                    connectionStatus.style.color = 'var(--color-incorrect)';
+                    updateConnectionStatus('disconnected', 'Отключено от сервера');
                 });
-                
+
+                socket.on('connect_error', (error) => {
+                    updateConnectionStatus('disconnected', 'Ошибка подключения: ' + error.message);
+                });
+
                 socket.on('pose_data', (data) => {
                     updateExerciseData(data.angle, data.is_correct);
                 });
             }
 
+            // Обновление статуса соединения
+            function updateConnectionStatus(status, message) {
+                connectionStatus.className = status;
+                connectionStatus.textContent = 'Статус: ' + message;
+            }
+
             // Обновление данных упражнения
             function updateExerciseData(angle, isCorrect) {
-                document.getElementById('angle_display').textContent = `${angle.toFixed(1)}°`;
-                
-                const formStatusIndicator = document.querySelector('#form_status .status-indicator');
-                const formStatusText = document.getElementById('form_status_text');
+                angleDisplay.textContent = `${angle.toFixed(1)}°`;
                 
                 if (isCorrect) {
                     formStatusIndicator.className = 'status-indicator correct';
@@ -270,10 +313,17 @@
                 totalCount++;
                 
                 const percentage = totalCount > 0 ? Math.round((correctCount / totalCount) * 100) : 0;
-                document.getElementById('correct_percentage').textContent = `${percentage}%`;
+                correctPercentageDisplay.textContent = `${percentage}%`;
                 
                 if (isWorkoutActive && workoutId) {
-                    fetch('/api/save_angle', {
+                    saveAngleData(angle, isCorrect);
+                }
+            }
+
+            // Сохранение данных угла
+            async function saveAngleData(angle, isCorrect) {
+                try {
+                    const response = await fetch('/api/save_angle', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
@@ -282,12 +332,43 @@
                             is_correct: isCorrect
                         })
                     });
+                    if (!response.ok) throw new Error('Ошибка сохранения данных');
+                } catch (error) {
+                    console.error('Ошибка сохранения угла:', error);
                 }
+            }
+
+            // Запуск обработки кадров
+            function startFrameProcessing() {
+                if (frameInterval) clearInterval(frameInterval);
+                
+                frameInterval = setInterval(() => {
+                    if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA && socket.connected) {
+                        // Устанавливаем размеры canvas
+                        if (poseCanvas.width !== videoElement.videoWidth || 
+                            poseCanvas.height !== videoElement.videoHeight) {
+                            poseCanvas.width = videoElement.videoWidth;
+                            poseCanvas.height = videoElement.videoHeight;
+                        }
+                        
+                        // Рисуем кадр на canvas
+                        ctx.drawImage(videoElement, 0, 0, poseCanvas.width, poseCanvas.height);
+                        
+                        // Отправляем кадр на сервер
+                        const frameData = poseCanvas.toDataURL('image/jpeg', 0.8);
+                        socket.emit('video_frame', {
+                            frame: frameData,
+                            exercise_type: currentExercise
+                        });
+                    }
+                }, 100); // 10 FPS
             }
 
             // Запуск камеры
             async function startCamera() {
                 try {
+                    updateConnectionStatus('connecting', 'Подключение камеры...');
+                    
                     stream = await navigator.mediaDevices.getUserMedia({ 
                         video: {
                             width: { ideal: 640 },
@@ -298,28 +379,22 @@
                     });
                     
                     videoElement.srcObject = stream;
-                    poseCanvas.width = videoElement.videoWidth;
-                    poseCanvas.height = videoElement.videoHeight;
-                    
-                    // Начинаем отправку кадров на сервер
-                    frameInterval = setInterval(() => {
-                        if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
-                            ctx.drawImage(videoElement, 0, 0, poseCanvas.width, poseCanvas.height);
-                            const frameData = poseCanvas.toDataURL('image/jpeg', 0.7);
-                            socket.emit('video_frame', {
-                                frame: frameData,
-                                exercise_type: currentExercise
-                            });
-                        }
-                    }, 100); // 10 FPS
-                    
                     isCameraActive = true;
+                    
                     startCameraBtn.disabled = true;
                     stopCameraBtn.disabled = false;
                     startWorkoutBtn.disabled = false;
                     
+                    // Запускаем обработку кадров после подключения
+                    if (socket.connected) {
+                        startFrameProcessing();
+                    }
+                    
+                    updateConnectionStatus('connected', 'Камера подключена');
+                    
                 } catch (error) {
                     console.error('Camera error:', error);
+                    updateConnectionStatus('disconnected', 'Ошибка камеры: ' + error.message);
                     alert('Не удалось подключить камеру: ' + error.message);
                 }
             }
@@ -340,37 +415,84 @@
                 ctx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
                 
                 isCameraActive = false;
+                isWorkoutActive = false;
+                
                 startCameraBtn.disabled = false;
                 stopCameraBtn.disabled = true;
                 startWorkoutBtn.disabled = true;
                 endWorkoutBtn.disabled = true;
+                
+                // Сбрасываем таймеры тренировки
+                if (workoutInterval) {
+                    clearInterval(workoutInterval);
+                    workoutInterval = null;
+                }
+                
+                updateConnectionStatus('disconnected', 'Камера отключена');
             }
 
-            // Инициализация
-            function init() {
-                connectSocket();
-                updateExerciseDisplay();
-                loadWorkoutHistory();
-                
-                // Обработчики событий
-                startCameraBtn.addEventListener('click', startCamera);
-                stopCameraBtn.addEventListener('click', stopCamera);
-                exerciseSelect.addEventListener('change', handleExerciseChange);
-                startWorkoutBtn.addEventListener('click', startWorkout);
-                endWorkoutBtn.addEventListener('click', endWorkout);
+            // Обновление отображения упражнения
+            function updateExerciseDisplay() {
+                const exercises = {
+                    'pushups': 'Отжимания',
+                    'squats': 'Приседания',
+                    'pullups': 'Подтягивания'
+                };
+                currentExerciseDisplay.textContent = exercises[currentExercise] || 'Неизвестно';
             }
-            
-            // Обработчик начала тренировки
-            startWorkoutBtn.addEventListener('click', async () => {
+
+            // Загрузка истории тренировок
+            async function loadWorkoutHistory() {
+                try {
+                    const response = await fetch('/api/workout_history');
+                    const data = await response.json();
+                    
+                    if (data.status === 'success') {
+                        workoutHistoryContainer.innerHTML = data.workouts.map(workout => `
+                            <div class="history-item">
+                                <h3>${workout.exercise_type}</h3>
+                                <p><strong>Начало:</strong> ${new Date(workout.start_time).toLocaleString()}</p>
+                                ${workout.end_time ? `<p><strong>Конец:</strong> ${new Date(workout.end_time).toLocaleString()}</p>` : ''}
+                                ${workout.duration_sec ? `<p><strong>Длительность:</strong> ${workout.duration_sec} сек</p>` : ''}
+                                <p><strong>Правильная техника:</strong> ${workout.correct_percentage?.toFixed(1) || 0}%</p>
+                                <button onclick="showWorkoutDetails(${workout.id})">Подробнее</button>
+                            </div>
+                        `).join('');
+                    }
+                } catch (error) {
+                    console.error('Ошибка загрузки истории:', error);
+                }
+            }
+
+            // Обработчик изменения упражнения
+            async function handleExerciseChange() {
+                currentExercise = exerciseSelect.value;
+                updateExerciseDisplay();
+                
+                if (socket.connected) {
+                    socket.emit('set_exercise', { exercise_type: currentExercise });
+                }
+                
+                if (isWorkoutActive) {
+                    try {
+                        await fetch('/api/set_exercise', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ exercise_type: currentExercise })
+                        });
+                    } catch (error) {
+                        console.error('Ошибка смены упражнения:', error);
+                    }
+                }
+            }
+
+            // Начало тренировки
+            async function startWorkout() {
                 try {
                     const response = await fetch('/api/start_workout', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            exercise_type: currentExercise
-                        })
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ exercise_type: currentExercise })
                     });
                     
                     const data = await response.json();
@@ -382,104 +504,79 @@
                         totalCount = 0;
                         isWorkoutActive = true;
                         
-                        // Обновляем UI
                         startWorkoutBtn.disabled = true;
                         endWorkoutBtn.disabled = false;
                         
-                        // Запускаем таймер тренировки
+                        // Таймер тренировки
                         workoutInterval = setInterval(() => {
                             const elapsedSeconds = Math.floor((Date.now() - workoutStartTime) / 1000);
                             timeDisplay.textContent = `${elapsedSeconds} сек`;
                         }, 1000);
-                        
-                        // Запускаем проверку углов (в демо-режиме - случайные значения)
-                        angleCheckInterval = setInterval(async () => {
-                            try {
-                                // В реальном приложении угол должен приходить с сервера через WebSocket
-                                // Для демо используем случайные значения
-                                const mockAngle = Math.floor(Math.random() * 180);
-                                const idealAngles = {
-                                    'pushups': { min: 80, max: 100 },
-                                    'squats': { min: 80, max: 100 },
-                                    'pullups': { min: 120, max: 150 }
-                                };
-                                const ideal = idealAngles[currentExercise] || idealAngles.pushups;
-                                const isCorrect = mockAngle >= ideal.min && mockAngle <= ideal.max;
-                                
-                                // Обновляем UI
-                                angleDisplay.textContent = `${mockAngle}°`;
-                                
-                                if (isCorrect) {
-                                    formStatusIndicator.className = 'status-indicator correct';
-                                    formStatusText.textContent = 'Правильно';
-                                    correctCount++;
-                                } else {
-                                    formStatusIndicator.className = 'status-indicator incorrect';
-                                    formStatusText.textContent = 'Неправильно';
-                                }
-                                totalCount++;
-                                
-                                const percentage = totalCount > 0 ? Math.round((correctCount / totalCount) * 100) : 0;
-                                correctPercentageDisplay.textContent = `${percentage}%`;
-                                
-                                // Сохраняем данные на сервере
-                                await fetch('/api/save_angle', {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json'
-                                    },
-                                    body: JSON.stringify({
-                                        workout_id: workoutId,
-                                        angle: mockAngle,
-                                        is_correct: isCorrect
-                                    })
-                                });
-                            } catch (error) {
-                                console.error('Ошибка сохранения угла:', error);
-                            }
-                        }, 1000);
                     }
                 } catch (error) {
                     console.error('Ошибка начала тренировки:', error);
-                    alert('Не удалось начать тренировку');
+                    alert('Не удалось начать тренировку: ' + error.message);
                 }
-            });
-            
-            // Обработчик завершения тренировки
-            endWorkoutBtn.addEventListener('click', async () => {
+            }
+
+            // Завершение тренировки
+            async function endWorkout() {
                 try {
                     const response = await fetch('/api/end_workout', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            workout_id: workoutId
-                        })
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ workout_id: workoutId })
                     });
                     
                     const data = await response.json();
                     
                     if (data.status === 'success') {
-                        // Останавливаем таймеры
                         clearInterval(workoutInterval);
-                        clearInterval(angleCheckInterval);
                         isWorkoutActive = false;
                         
-                        // Обновляем UI
                         startWorkoutBtn.disabled = false;
                         endWorkoutBtn.disabled = true;
                         
-                        // Показываем статистику
                         alert(`Тренировка завершена!\nПравильных движений: ${data.stats?.correct_percentage?.toFixed(1) || 0}%`);
-                        
-                        // Обновляем историю
                         loadWorkoutHistory();
                     }
                 } catch (error) {
                     console.error('Ошибка завершения тренировки:', error);
                 }
-            });
+            }
+
+            // Глобальная функция для показа деталей тренировки
+            window.showWorkoutDetails = async (workoutId) => {
+                try {
+                    const response = await fetch(`/api/workout_details?id=${workoutId}`);
+                    const data = await response.json();
+                    
+                    if (data.status === 'success') {
+                        alert(`Детали тренировки #${workoutId}\n` +
+                              `Всего движений: ${data.stats.total_count}\n` +
+                              `Правильных: ${data.stats.correct_count}\n` +
+                              `Процент правильных: ${data.stats.correct_percentage.toFixed(1)}%`);
+                    }
+                } catch (error) {
+                    console.error('Ошибка загрузки деталей:', error);
+                }
+            };
+
+            // Инициализация приложения
+            function init() {
+                initSocketConnection();
+                updateExerciseDisplay();
+                loadWorkoutHistory();
+                
+                // Обработчики событий
+                startCameraBtn.addEventListener('click', startCamera);
+                stopCameraBtn.addEventListener('click', stopCamera);
+                exerciseSelect.addEventListener('change', handleExerciseChange);
+                startWorkoutBtn.addEventListener('click', startWorkout);
+                endWorkoutBtn.addEventListener('click', endWorkout);
+            }
+
+            init();
         });
     </script>
 </body>
