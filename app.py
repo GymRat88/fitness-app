@@ -36,31 +36,19 @@ EXERCISE_CONFIG = {
     "pushups": {
         "min_angle": 80,
         "max_angle": 100,
-        "points": {
-            "a": mp_pose.PoseLandmark.LEFT_SHOULDER,
-            "b": mp_pose.PoseLandmark.LEFT_ELBOW,
-            "c": mp_pose.PoseLandmark.LEFT_WRIST
-        },
+        "points": ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"],
         "name": "Отжимания"
     },
     "squats": {
         "min_angle": 80,
         "max_angle": 100,
-        "points": {
-            "a": mp_pose.PoseLandmark.LEFT_HIP,
-            "b": mp_pose.PoseLandmark.LEFT_KNEE,
-            "c": mp_pose.PoseLandmark.LEFT_ANKLE
-        },
+        "points": ["LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"],
         "name": "Приседания"
     },
     "pullups": {
         "min_angle": 120,
         "max_angle": 150,
-        "points": {
-            "a": mp_pose.PoseLandmark.LEFT_SHOULDER,
-            "b": mp_pose.PoseLandmark.LEFT_ELBOW,
-            "c": mp_pose.PoseLandmark.LEFT_WRIST
-        },
+        "points": ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"],
         "name": "Подтягивания"
     }
 }
@@ -76,7 +64,6 @@ def init_db():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Таблица тренировок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS workouts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +78,6 @@ def init_db():
             )
         ''')
         
-        # Таблица данных тренировки
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS workout_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +97,6 @@ def init_db():
         if conn:
             conn.close()
 
-# Расчет угла между тремя точками
 def calculate_angle(a, b, c):
     a = np.array(a)
     b = np.array(b)
@@ -122,43 +107,33 @@ def calculate_angle(a, b, c):
     
     return angle if angle <= 180 else 360 - angle
 
-# Обработка кадра с MediaPipe
 def process_frame(frame, exercise_type="pushups"):
     try:
         if frame is None or frame.size == 0:
             logger.warning("Empty frame received")
             return None, 0, False
 
-        # Конвертация и обработка кадра
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(frame_rgb)
         
         if not results.pose_landmarks:
             return frame, 0, False
 
-        # Получаем конфигурацию для текущего упражнения
         config = EXERCISE_CONFIG.get(exercise_type, EXERCISE_CONFIG["pushups"])
         landmarks = results.pose_landmarks.landmark
+        
+        # Получаем точки для выбранного упражнения
+        point_names = config["points"]
+        points = []
+        
+        for point_name in point_names:
+            landmark = getattr(mp_pose.PoseLandmark, point_name)
+            point = landmarks[landmark.value]
+            points.append((point.x * frame.shape[1], point.y * frame.shape[0]))
 
-        # Получаем точки для расчета угла
-        a = [
-            landmarks[config["points"]["a"].x * frame.shape[1],
-            landmarks[config["points"]["a"].y * frame.shape[0],
-        ]
-        b = [
-            landmarks[config["points"]["b"].x * frame.shape[1],
-            landmarks[config["points"]["b"].y * frame.shape[0],
-        ]
-        c = [
-            landmarks[config["points"]["c"].x * frame.shape[1],
-            landmarks[config["points"]["c"].y * frame.shape[0],
-        ]
-
-        # Рассчитываем угол
-        angle = calculate_angle(a, b, c)
+        angle = calculate_angle(points[0], points[1], points[2])
         is_correct = config["min_angle"] <= angle <= config["max_angle"]
         
-        # Отрисовываем скелет
         color = (0, 255, 0) if is_correct else (0, 0, 255)
         mp_drawing.draw_landmarks(
             frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
@@ -166,7 +141,6 @@ def process_frame(frame, exercise_type="pushups"):
             mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2)
         )
 
-        # Добавляем информацию об угле
         cv2.putText(frame, f"{config['name']}: {angle:.1f}°", (20, 50), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         cv2.putText(frame, "CORRECT" if is_correct else "INCORRECT", (20, 80), 
@@ -178,13 +152,13 @@ def process_frame(frame, exercise_type="pushups"):
         logger.error(f"Error processing frame: {str(e)}")
         return frame, 0, False
 
-# Маршруты Flask
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/workout_history')
 def get_workout_history():
+    conn = None
     try:
         conn = get_db_connection()
         workouts = conn.execute('''
@@ -208,6 +182,7 @@ def get_workout_history():
 
 @app.route('/api/start_workout', methods=['POST'])
 def start_workout():
+    conn = None
     try:
         data = request.get_json()
         exercise_type = data.get('exercise_type', 'pushups')
@@ -240,6 +215,7 @@ def start_workout():
 
 @app.route('/api/end_workout', methods=['POST'])
 def end_workout():
+    conn = None
     try:
         data = request.get_json()
         workout_id = data.get('workout_id')
@@ -269,6 +245,7 @@ def end_workout():
 
 @app.route('/api/save_angle', methods=['POST'])
 def save_angle():
+    conn = None
     try:
         data = request.get_json()
         workout_id = data.get('workout_id')
@@ -281,13 +258,11 @@ def save_angle():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Сохраняем данные угла
         cursor.execute('''
             INSERT INTO workout_data (workout_id, timestamp, angle, is_correct)
             VALUES (?, ?, ?, ?)
         ''', (workout_id, datetime.now().isoformat(), angle, is_correct))
         
-        # Обновляем статистику тренировки
         cursor.execute('''
             UPDATE workouts 
             SET total_count = total_count + 1,
@@ -308,7 +283,6 @@ def save_angle():
         if conn:
             conn.close()
 
-# Обработчики WebSocket
 @socketio.on('connect')
 def handle_connect():
     logger.info(f"Client connected: {request.sid}")
@@ -321,7 +295,6 @@ def handle_disconnect():
 @socketio.on('video_frame')
 def handle_video_frame(data):
     try:
-        # Декодируем изображение из base64
         frame_data = data['frame'].split(',')[1]
         nparr = np.frombuffer(base64.b64decode(frame_data), np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -330,18 +303,15 @@ def handle_video_frame(data):
             logger.warning("Failed to decode frame")
             return
         
-        # Обрабатываем кадр
         exercise_type = data.get('exercise_type', 'pushups')
         processed_frame, angle, is_correct = process_frame(frame, exercise_type)
         
         if processed_frame is None:
             return
         
-        # Кодируем обработанный кадр в base64
         _, buffer = cv2.imencode('.jpg', processed_frame)
         processed_frame_data = base64.b64encode(buffer).decode('utf-8')
         
-        # Отправляем результаты обратно клиенту
         socketio.emit('processed_frame', {
             'frame': 'data:image/jpeg;base64,' + processed_frame_data,
             'angle': angle,
@@ -352,7 +322,6 @@ def handle_video_frame(data):
     except Exception as e:
         logger.error(f"Error processing video frame: {str(e)}")
 
-# Запуск приложения
 if __name__ == '__main__':
     init_db()
     socketio.run(app, 
